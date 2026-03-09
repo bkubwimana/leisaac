@@ -36,6 +36,10 @@ parser.add_argument("--policy_timeout_ms", type=int, default=15000, help="Timeou
 parser.add_argument("--policy_action_horizon", type=int, default=16, help="Action horizon of the policy.")
 parser.add_argument("--policy_language_instruction", type=str, default=None, help="Language instruction of the policy.")
 parser.add_argument("--policy_checkpoint_path", type=str, default=None, help="Checkpoint path of the policy.")
+parser.add_argument("--policy_device", type=str, default=None, help="Device for policy inference (e.g. cuda:1). Defaults to --device.")
+parser.add_argument("--policy_camera_remap", type=str, default=None, help="Remap env camera names for policy, e.g. 'front=camera1,wrist=camera2'")
+parser.add_argument("--save_video", action="store_true", help="Save episode videos from the front camera.")
+parser.add_argument("--video_dir", type=str, default="logs/videos", help="Directory to save episode videos.")
 
 
 # append AppLauncher cli args
@@ -49,10 +53,12 @@ app_launcher_args = vars(args_cli)
 app_launcher = AppLauncher(app_launcher_args)
 simulation_app = app_launcher.app
 
+import os
 import time
 
 import carb
 import gymnasium as gym
+import numpy as np
 import omni
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
@@ -63,6 +69,108 @@ from leisaac.utils.env_utils import (
 )
 
 import leisaac  # noqa: F401
+
+
+class EpisodeStepLogger:
+    """Logs per-step telemetry to a jsonl file for post-run analysis."""
+
+    def __init__(self, log_dir: str):
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir
+        self._fh = None
+        self._step = 0
+
+    def begin_episode(self, episode_id: int):
+        import json  # noqa: F811
+        if self._fh:
+            self._fh.close()
+        path = os.path.join(self.log_dir, f"episode_{episode_id}_steps.jsonl")
+        self._fh = open(path, "w")
+        self._step = 0
+        self._json = json
+
+    def log_step(self, obs_dict: dict, action: torch.Tensor):
+        if not self._fh:
+            return
+        row = {"step": self._step, "t": time.time()}
+        for key in ("joint_pos", "joint_vel", "joint_pos_target", "ee_frame_state", "user_vel_state"):
+            if key in obs_dict:
+                val = obs_dict[key]
+                if isinstance(val, torch.Tensor):
+                    val = val[0].cpu().tolist()
+                row[key] = val
+        if isinstance(action, torch.Tensor):
+            row["action"] = action.flatten().cpu().tolist()
+        self._fh.write(self._json.dumps(row) + "\n")
+        self._step += 1
+
+    def end_episode(self):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+        print(f"[StepLog] Saved {self._step} steps -> {self.log_dir}")
+
+
+class EpisodeVideoRecorder:
+    """Records front+wrist side-by-side and a separate viewport (scene) video."""
+
+    def __init__(self, video_dir: str, fps: int = 30):
+        os.makedirs(video_dir, exist_ok=True)
+        self.video_dir = video_dir
+        self.fps = fps
+        self._robot_frames: list[np.ndarray] = []
+        self._scene_frames: list[np.ndarray] = []
+        self._viewport_annotator = None
+
+    def setup_viewport(self):
+        """Create a render-product annotator on the viewport camera."""
+        try:
+            import omni.replicator.core as rep
+            rp = rep.create.render_product("/OmniverseKit_Persp", (640, 480))
+            self._viewport_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            self._viewport_annotator.attach([rp])
+        except Exception as e:
+            print(f"[Video] Viewport capture not available: {e}")
+            self._viewport_annotator = None
+
+    def capture(self, obs_dict: dict, env=None):
+        panels = []
+        for cam in ("front", "wrist"):
+            if cam in obs_dict:
+                panels.append(obs_dict[cam][0].cpu().numpy().astype(np.uint8))
+        if panels:
+            if len(panels) == 2 and panels[0].shape[0] != panels[1].shape[0]:
+                h = panels[0].shape[0]
+                from PIL import Image
+                p1 = np.array(Image.fromarray(panels[1]).resize(
+                    (int(panels[1].shape[1] * h / panels[1].shape[0]), h)))
+                panels[1] = p1
+            self._robot_frames.append(np.concatenate(panels, axis=1) if len(panels) > 1 else panels[0])
+
+        if self._viewport_annotator is not None:
+            try:
+                data = self._viewport_annotator.get_data()
+                if data is not None and hasattr(data, 'shape') and len(data.shape) >= 3:
+                    self._scene_frames.append(np.array(data[:, :, :3], dtype=np.uint8))
+            except Exception:
+                pass
+
+    def save(self, episode_id: int):
+        import imageio
+        if self._robot_frames:
+            path = os.path.join(self.video_dir, f"episode_{episode_id}_robot.mp4")
+            imageio.mimwrite(path, self._robot_frames, fps=self.fps, quality=8)
+            print(f"[Video] Robot cams: {len(self._robot_frames)} frames -> {path}")
+        if self._scene_frames:
+            path = os.path.join(self.video_dir, f"episode_{episode_id}_scene.mp4")
+            imageio.mimwrite(path, self._scene_frames, fps=self.fps, quality=8)
+            print(f"[Video] Scene view: {len(self._scene_frames)} frames -> {path}")
+        self._robot_frames.clear()
+        self._scene_frames.clear()
+
+    def reset(self):
+        self._robot_frames.clear()
+        self._scene_frames.clear()
 
 
 class RateLimiter:
@@ -191,19 +299,29 @@ def main():
         model_type = "lerobot"
 
         policy_type = args_cli.policy_type.split("-")[1]
+        policy_dev = args_cli.policy_device or args_cli.device
+        cam_remap = {}
+        if args_cli.policy_camera_remap:
+            for pair in args_cli.policy_camera_remap.split(","):
+                src, dst = pair.split("=")
+                cam_remap[src.strip()] = dst.strip()
+        raw_cams = {
+            key: sensor.image_shape for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)
+        }
+        camera_infos = {cam_remap.get(k, k): v for k, v in raw_cams.items()}
         policy = LeRobotServicePolicyClient(
             host=args_cli.policy_host,
             port=args_cli.policy_port,
             timeout_ms=args_cli.policy_timeout_ms,
-            camera_infos={
-                key: sensor.image_shape for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)
-            },
+            camera_infos=camera_infos,
             task_type=task_type,
             policy_type=policy_type,
             pretrained_name_or_path=args_cli.policy_checkpoint_path,
             actions_per_chunk=args_cli.policy_action_horizon,
-            device=args_cli.device,
+            device=policy_dev,
         )
+        if cam_remap:
+            policy.set_camera_env_keys(list(raw_cams.keys()))
     elif args_cli.policy_type == "openpi":
         from isaaclab.sensors import Camera
         from leisaac.policy import OpenPIServicePolicyClient
@@ -217,6 +335,11 @@ def main():
 
     rate_limiter = RateLimiter(args_cli.step_hz)
     controller = Controller()
+    recorder = None
+    if args_cli.save_video:
+        recorder = EpisodeVideoRecorder(args_cli.video_dir, fps=args_cli.step_hz)
+        recorder.setup_viewport()
+    step_logger = EpisodeStepLogger(args_cli.video_dir)
 
     # reset environment
     obs_dict, _ = env.reset()
@@ -228,6 +351,9 @@ def main():
     # simulate environment
     while max_episode_count <= 0 or episode_count <= max_episode_count:
         print(f"[Evaluation] Evaluating episode {episode_count}...")
+        if recorder:
+            recorder.reset()
+        step_logger.begin_episode(episode_count)
         success, time_out = False, False
         while simulation_app.is_running():
             # run everything in inference mode
@@ -245,6 +371,10 @@ def main():
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
                     obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
+                    step_obs = obs_dict.get("policy", obs_dict)
+                    step_logger.log_step(step_obs, action)
+                    if recorder:
+                        recorder.capture(step_obs, env)
                     if reset_terminated[0]:
                         success = True
                         break
@@ -255,11 +385,17 @@ def main():
                         rate_limiter.sleep(env)
             if success:
                 print(f"[Evaluation] Episode {episode_count} is successful!")
+                step_logger.end_episode()
+                if recorder:
+                    recorder.save(episode_count)
                 episode_count += 1
                 success_count += 1
                 break
             if time_out:
                 print(f"[Evaluation] Episode {episode_count} timed out!")
+                step_logger.end_episode()
+                if recorder:
+                    recorder.save(episode_count)
                 episode_count += 1
                 break
         print(

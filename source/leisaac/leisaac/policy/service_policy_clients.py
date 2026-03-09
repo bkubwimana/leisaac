@@ -4,7 +4,7 @@ import time
 import grpc
 import numpy as np
 import torch
-from leisaac.utils.constant import SINGLE_ARM_JOINT_NAMES
+from leisaac.utils.constant import LEKIWI_JOINT_NAMES, SINGLE_ARM_JOINT_NAMES
 from leisaac.utils.robot_utils import (
     convert_leisaac_action_to_lerobot,
     convert_lerobot_action_to_leisaac,
@@ -15,6 +15,29 @@ from .lerobot.helpers import RemotePolicyConfig, TimedObservation
 from .lerobot.transport import services_pb2, services_pb2_grpc
 from .lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from .openpi import image_tools
+
+
+def convert_lerobot_action_to_leisaac_by_task(action: torch.Tensor | np.ndarray, task_type: str) -> np.ndarray:
+    if isinstance(action, torch.Tensor):
+        action = action.cpu().numpy()
+
+    if task_type == "so101leader":
+        return convert_lerobot_action_to_leisaac(action)
+
+    if task_type.startswith("lekiwi"):
+        if action.shape[-1] < 6:
+            raise ValueError(f"Expected at least 6 action dims for lekiwi, got {action.shape[-1]}")
+        arm_action = convert_lerobot_action_to_leisaac(action[:, :6])
+        if action.shape[-1] == 6:
+            wheel_action = np.zeros((action.shape[0], 3), dtype=action.dtype)
+            return np.concatenate([arm_action, wheel_action], axis=1)
+        wheel_action = action[:, 6:9]
+        if action.shape[-1] == 9:
+            return np.concatenate([arm_action, wheel_action], axis=1)
+        passthrough_action = action[:, 9:]
+        return np.concatenate([arm_action, wheel_action, passthrough_action], axis=1)
+
+    raise ValueError(f"Task type {task_type} not supported")
 
 
 class Gr00tServicePolicyClient(ZMQServicePolicy):
@@ -225,7 +248,17 @@ class LeRobotServicePolicyClient(Policy):
                 "names": [f"{joint_name}.pos" for joint_name in SINGLE_ARM_JOINT_NAMES],
             }
             self.last_action = np.zeros((1, 6))
+        elif task_type.startswith("lekiwi"):
+            lerobot_features["observation.state"] = {
+                "dtype": "float32",
+                "shape": (9,),
+                "names": [f"{joint_name}.pos" for joint_name in LEKIWI_JOINT_NAMES[:-3]]
+                + [f"{joint_name}.vel" for joint_name in LEKIWI_JOINT_NAMES[-3:]],
+            }
+            self.last_action = np.zeros((1, 9))
         # TODO: add bi-arm support
+        else:
+            raise ValueError(f"Task type {task_type} not supported")
 
         for camera_key, camera_image_shape in camera_infos.items():
             lerobot_features[f"observation.images.{camera_key}"] = {
@@ -234,6 +267,7 @@ class LeRobotServicePolicyClient(Policy):
                 "names": ["height", "width", "channels"],
             }
         self.camera_keys = list(camera_infos.keys())
+        self.camera_env_keys = list(camera_infos.keys())
 
         self.policy_config = RemotePolicyConfig(
             policy_type,
@@ -265,9 +299,14 @@ class LeRobotServicePolicyClient(Policy):
         except grpc.RpcError:
             raise RuntimeError("Failed to connect to policy server")
 
+    def set_camera_env_keys(self, env_keys: list[str]):
+        """Override the env-side camera keys used for observation lookups."""
+        self.camera_env_keys = env_keys
+
     def _send_observation(self, observation_dict: dict):
         raw_observation = {
-            f"{key}": observation_dict[key].cpu().numpy().astype(np.uint8)[0] for key in self.camera_keys
+            policy_key: observation_dict[env_key].cpu().numpy().astype(np.uint8)[0]
+            for policy_key, env_key in zip(self.camera_keys, self.camera_env_keys)
         }
         raw_observation["task"] = observation_dict["task_description"]
 
@@ -275,6 +314,14 @@ class LeRobotServicePolicyClient(Policy):
             joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
             for joint_name in SINGLE_ARM_JOINT_NAMES:
                 raw_observation[f"{joint_name}.pos"] = joint_pos[0, SINGLE_ARM_JOINT_NAMES.index(joint_name)].item()
+        elif self.task_type.startswith("lekiwi"):
+            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"][:, :6])
+            for joint_name in SINGLE_ARM_JOINT_NAMES:
+                raw_observation[f"{joint_name}.pos"] = joint_pos[0, SINGLE_ARM_JOINT_NAMES.index(joint_name)].item()
+            user_vel_state = observation_dict["user_vel_state"].cpu().numpy()
+            raw_observation["x.vel"] = user_vel_state[0, 0].item()
+            raw_observation["y.vel"] = user_vel_state[0, 1].item()
+            raw_observation["theta.vel"] = user_vel_state[0, 2].item()
         # TODO: add bi-arm support
 
         """
@@ -325,7 +372,7 @@ class LeRobotServicePolicyClient(Policy):
 
         action_list = [action.get_action()[None, :] for action in action_chunk]
         concat_action = torch.cat(action_list, dim=0)
-        concat_action = convert_lerobot_action_to_leisaac(concat_action)
+        concat_action = convert_lerobot_action_to_leisaac_by_task(concat_action, self.task_type)
 
         self.last_action = concat_action[-1, :]
         self.skip_send_observation = False

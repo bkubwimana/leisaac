@@ -1,5 +1,6 @@
 import sys
 import types
+from importlib.util import find_spec
 
 from . import helpers
 from .helpers import *
@@ -20,7 +21,10 @@ def create_module_hierarchy(path: str):
                 setattr(sys.modules[parent_path], parts[i - 1], mod)
 
 
-helpers_path = "lerobot.scripts.server.helpers"
+if find_spec("lerobot.async_inference.helpers") is not None:
+    helpers_path = "lerobot.async_inference.helpers"
+else:
+    helpers_path = "lerobot.scripts.server.helpers"
 create_module_hierarchy(helpers_path)
 
 fake_lerobot_module = sys.modules[helpers_path]
